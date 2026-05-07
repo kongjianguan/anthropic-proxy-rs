@@ -32,6 +32,12 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// DeepSeek `reasoning_content` — pass back assistant thinking content
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "reasoning_content"
+    )]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +122,9 @@ pub struct ChoiceMessage {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// DeepSeek-style `reasoning_content` in non‑streaming responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +184,11 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Accept both `reasoning` (OpenAI-style) and `reasoning_content` (DeepSeek-style)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning_content"
+    )]
     pub reasoning: Option<String>,
 }
 

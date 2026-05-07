@@ -31,6 +31,7 @@ pub fn translate_request(
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    reasoning_content: None,
                 });
             }
             anthropic::SystemPrompt::Multiple(messages) => {
@@ -44,6 +45,7 @@ pub fn translate_request(
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -91,6 +93,15 @@ pub fn translate_response(
         .ok_or_else(|| ProxyError::Transform("No choices in response".to_string()))?;
 
     let mut content = Vec::new();
+
+    if let Some(reasoning) = &choice.message.reasoning_content {
+        if !reasoning.is_empty() {
+            content.push(anthropic::ResponseContent::Thinking {
+                content_type: "thinking".to_string(),
+                thinking: reasoning.clone(),
+            });
+        }
+    }
 
     if let Some(text) = &choice.message.content {
         if !text.is_empty() {
@@ -572,6 +583,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("hello".to_string()),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
@@ -601,6 +613,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("pong".to_string()),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
@@ -615,6 +628,47 @@ mod tests {
         let anthropic = translate_response(response, "openai/gpt-4o-mini").unwrap();
         assert_eq!(anthropic.id, "msg_proxy");
         assert_eq!(anthropic.model, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn response_with_reasoning_content_produces_thinking_block() {
+        let response = openai::OpenAIResponse {
+            id: Some("chatcmpl-ds".to_string()),
+            object: None,
+            created: None,
+            model: Some("deepseek-v4-flash".to_string()),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("The answer is 42.".to_string()),
+                    tool_calls: None,
+                    reasoning_content: Some("Let me think step by step...".to_string()),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = translate_response(response, "fallback").unwrap();
+        assert_eq!(anthropic.content.len(), 2);
+        match &anthropic.content[0] {
+            anthropic::ResponseContent::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "Let me think step by step...");
+            }
+            _ => panic!("expected thinking block first"),
+        }
+        match &anthropic.content[1] {
+            anthropic::ResponseContent::Text { text, .. } => {
+                assert_eq!(text, "The answer is 42.");
+            }
+            _ => panic!("expected text block second"),
+        }
     }
 
     #[test]
@@ -637,6 +691,7 @@ mod tests {
                             arguments: "{\"path\":\"/tmp\"}".to_string(),
                         },
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
             }],

@@ -13,11 +13,13 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
             });
         }
         anthropic::MessageContent::Blocks(blocks) => {
             let mut content_parts = Vec::new();
             let mut tool_calls = Vec::new();
+            let mut reasoning_content: Option<String> = None;
 
             for block in blocks {
                 match block {
@@ -52,13 +54,18 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id),
                             name: None,
+                            reasoning_content: None,
                         });
                     }
-                    anthropic::ContentBlock::Thinking { .. } => {}
+                    anthropic::ContentBlock::Thinking { thinking } => {
+                        if msg.role == "assistant" {
+                            reasoning_content = Some(thinking);
+                        }
+                    }
                 }
             }
 
-            if !content_parts.is_empty() || !tool_calls.is_empty() {
+            if !content_parts.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some() {
                 let content = if content_parts.is_empty() {
                     None
                 } else if content_parts.len() == 1 {
@@ -82,6 +89,7 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                     },
                     tool_call_id: None,
                     name: None,
+                    reasoning_content,
                 });
             }
         }
@@ -355,6 +363,50 @@ mod tests {
             tool_type: Some("BatchTool".into()),
         };
         assert!(is_batch_tool(&tool));
+    }
+
+    #[test]
+    fn assistant_thinking_block_sets_reasoning_content() {
+        let msg = anthropic::Message {
+            role: "assistant".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::Thinking {
+                    thinking: "Let me reason about this.".to_string(),
+                },
+                anthropic::ContentBlock::Text {
+                    text: "The answer is 42.".to_string(),
+                    cache_control: None,
+                },
+            ]),
+        };
+
+        let result = translate_message(msg).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].reasoning_content,
+            Some("Let me reason about this.".to_string())
+        );
+        match &result[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "The answer is 42.");
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn non_assistant_thinking_block_does_not_set_reasoning_content() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::Thinking {
+                    thinking: "should not appear".to_string(),
+                },
+            ]),
+        };
+
+        let result = translate_message(msg).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]

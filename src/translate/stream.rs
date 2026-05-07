@@ -127,6 +127,12 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
 }
 
 fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
+    let content = if reasoning.trim().is_empty() {
+        "(reasoning omitted)"
+    } else {
+        reasoning
+    };
+
     if !matches!(state.block, BlockState::Thinking { .. }) {
         close_current_block(events, state);
         let index = state.next_index;
@@ -143,7 +149,7 @@ fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reason
         events.push(StreamEvent::ContentBlockDelta {
             index,
             delta: Delta::ThinkingDelta {
-                thinking: reasoning.to_string(),
+                thinking: content.to_string(),
             },
         });
     }
@@ -425,6 +431,44 @@ mod tests {
         if let StreamEvent::Error { error } = &events[0] {
             assert!(error.message.contains("connection reset"));
         }
+    }
+
+    #[test]
+    fn empty_reasoning_replaced_with_omitted() {
+        let mut state = initial_state("fallback".into());
+
+        let chunk: openai::StreamChunk = serde_json::from_value(json!({
+            "id": "1", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "reasoning": "" } }]
+        }))
+        .unwrap();
+
+        let events = translate_chunk(&mut state, &chunk);
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ContentBlockDelta { delta: Delta::ThinkingDelta { thinking }, .. } = e {
+                    Some(thinking.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(deltas, vec!["(reasoning omitted)"]);
+    }
+
+    #[test]
+    fn delta_reasoning_accepts_both_field_names() {
+        // `reasoning` (standard OpenAI)
+        let from_reasoning: openai::Delta =
+            serde_json::from_str(r#"{"reasoning": "think a"}"#).unwrap();
+        assert_eq!(from_reasoning.reasoning.as_deref(), Some("think a"));
+
+        // `reasoning_content` (DeepSeek-style)
+        let from_content: openai::Delta =
+            serde_json::from_str(r#"{"reasoning_content": "think b"}"#).unwrap();
+        assert_eq!(from_content.reasoning.as_deref(), Some("think b"));
     }
 
     #[test]
