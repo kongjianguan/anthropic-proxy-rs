@@ -127,11 +127,13 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
 }
 
 fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
-    let content = if reasoning.trim().is_empty() {
-        "(reasoning omitted)"
-    } else {
-        reasoning
-    };
+    // Skip empty reasoning chunks — they carry no semantic content (DeepSeek
+    // sends empty `reasoning_content` for role/state transitions). Matching
+    // upstream SDK behaviour: `if reasoning_content:` (Python SDK), and
+    // `!reasoning.is_empty()` in deepseek-tui.
+    if reasoning.trim().is_empty() {
+        return;
+    }
 
     if !matches!(state.block, BlockState::Thinking { .. }) {
         close_current_block(events, state);
@@ -149,7 +151,7 @@ fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reason
         events.push(StreamEvent::ContentBlockDelta {
             index,
             delta: Delta::ThinkingDelta {
-                thinking: content.to_string(),
+                thinking: reasoning.to_string(),
             },
         });
     }
@@ -434,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_reasoning_replaced_with_omitted() {
+    fn empty_reasoning_does_not_emit_delta() {
         let mut state = initial_state("fallback".into());
 
         let chunk: openai::StreamChunk = serde_json::from_value(json!({
@@ -455,7 +457,10 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(deltas, vec!["(reasoning omitted)"]);
+        // Empty reasoning chunks are skipped entirely — no delta emitted.
+        assert!(deltas.is_empty());
+        // No thinking block should have been started either.
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::ContentBlockStart { .. })));
     }
 
     #[test]

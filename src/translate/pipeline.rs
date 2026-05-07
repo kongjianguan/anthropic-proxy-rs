@@ -441,7 +441,7 @@ mod tests {
                     content: anthropic::MessageContent::Blocks(vec![
                         anthropic::ContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
-                            content: "file contents".to_string(),
+                            content: json!("file contents"),
                             is_error: None,
                         },
                     ]),

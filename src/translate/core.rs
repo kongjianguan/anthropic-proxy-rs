@@ -48,9 +48,10 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                         content,
                         ..
                     } => {
+                        let text = flatten_tool_result_content(&content);
                         result.push(openai::Message {
                             role: "tool".to_string(),
-                            content: Some(openai::MessageContent::Text(content)),
+                            content: Some(openai::MessageContent::Text(text)),
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id),
                             name: None,
@@ -212,6 +213,26 @@ pub fn remove_term(text: &str, term: &str) -> String {
 
     result.push_str(&text[cursor..]);
     result
+}
+
+/// Convert a `tool_result.content` value (string or array of content blocks) to a plain string.
+fn flatten_tool_result_content(content: &serde_json::Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => {
+            let mut parts: Vec<String> = Vec::new();
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        // null, number, object, bool — unlikely but don't crash
+        other => other.to_string(),
+    }
 }
 
 pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
@@ -407,6 +428,57 @@ mod tests {
 
         let result = translate_message(msg).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn tool_result_with_string_content_works() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!("plain string result"),
+                    is_error: None,
+                },
+            ]),
+        };
+
+        let result = translate_message(msg).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "tool");
+        match &result[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "plain string result");
+            }
+            _ => panic!("expected text content"),
+        }
+        assert_eq!(result[0].tool_call_id, Some("call_1".to_string()));
+    }
+
+    #[test]
+    fn tool_result_with_array_content_works() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::ToolResult {
+                    tool_use_id: "call_2".to_string(),
+                    content: json!([
+                        {"type": "text", "text": "stdout line 1"},
+                        {"type": "text", "text": "stdout line 2"},
+                    ]),
+                    is_error: None,
+                },
+            ]),
+        };
+
+        let result = translate_message(msg).unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "stdout line 1\nstdout line 2");
+            }
+            _ => panic!("expected text content"),
+        }
     }
 
     #[test]
