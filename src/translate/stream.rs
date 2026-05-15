@@ -4,6 +4,7 @@ use crate::models::anthropic::{
 };
 use crate::models::openai;
 use crate::translate::core;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 enum BlockState {
@@ -32,6 +33,9 @@ pub struct StreamState {
     block: BlockState,
     next_index: usize,
     message_started: bool,
+    finished: bool,
+    /// Maps OpenAI DeltaToolCall.index → Anthropic content_block index
+    tool_call_map: HashMap<usize, usize>,
 }
 
 pub fn initial_state(fallback_model: String) -> StreamState {
@@ -42,6 +46,8 @@ pub fn initial_state(fallback_model: String) -> StreamState {
         block: BlockState::Idle,
         next_index: 0,
         message_started: false,
+        finished: false,
+        tool_call_map: HashMap::new(),
     }
 }
 
@@ -106,8 +112,22 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
     events
 }
 
-pub fn translate_done(_state: &mut StreamState) -> Vec<StreamEvent> {
-    vec![StreamEvent::MessageStop]
+pub fn translate_done(state: &mut StreamState) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    close_current_block(&mut events, state);
+    if !state.finished {
+        events.push(StreamEvent::MessageDelta {
+            delta: MessageDeltaData {
+                stop_reason: None,
+                stop_sequence: None,
+            },
+            usage: DeltaUsage {
+                output_tokens: 0,
+            },
+        });
+    }
+    events.push(StreamEvent::MessageStop);
+    events
 }
 
 pub fn translate_error(message: String) -> Vec<StreamEvent> {
@@ -123,6 +143,7 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
     if let Some(index) = state.block.current_index() {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
+        state.block = BlockState::Idle;
     }
 }
 
@@ -187,32 +208,42 @@ fn emit_tool_calls(
 ) {
     for tool_call in tool_calls {
         if let Some(id) = &tool_call.id {
-            close_current_block(events, state);
-            let index = state.next_index;
+            // Only open a new block if this upstream index hasn't been mapped yet
+            if !state.tool_call_map.contains_key(&tool_call.index) {
+                close_current_block(events, state);
+                let index = state.next_index;
 
-            if let Some(function) = &tool_call.function {
-                if let Some(name) = &function.name {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index,
-                        content_block: ContentBlockStart::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                        },
-                    });
-                    state.block = BlockState::ToolUse { index };
+                if let Some(function) = &tool_call.function {
+                    if let Some(name) = &function.name {
+                        state.tool_call_map.insert(tool_call.index, index);
+                        events.push(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlockStart::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                            },
+                        });
+                        state.block = BlockState::ToolUse { index };
+                    }
                 }
             }
         }
 
         if let Some(function) = &tool_call.function {
             if let Some(args) = &function.arguments {
-                if let BlockState::ToolUse { index } = state.block {
-                    events.push(StreamEvent::ContentBlockDelta {
-                        index,
-                        delta: Delta::InputJsonDelta {
-                            partial_json: args.clone(),
-                        },
-                    });
+                // Use upstream index mapping to find the correct block
+                if let Some(&block_index) = state.tool_call_map.get(&tool_call.index) {
+                    // Only emit if the mapped block is currently active
+                    if let BlockState::ToolUse { index } = state.block {
+                        if index == block_index {
+                            events.push(StreamEvent::ContentBlockDelta {
+                                index,
+                                delta: Delta::InputJsonDelta {
+                                    partial_json: args.clone(),
+                                },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -225,6 +256,10 @@ fn emit_finish(
     finish_reason: &str,
     usage: Option<&openai::Usage>,
 ) {
+    if state.finished {
+        return;
+    }
+
     close_current_block(events, state);
 
     let stop_reason = core::map_stop_reason(Some(finish_reason));
@@ -238,6 +273,8 @@ fn emit_finish(
             output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
         },
     });
+
+    state.finished = true;
 }
 
 #[cfg(test)]

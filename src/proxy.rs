@@ -443,6 +443,42 @@ mod tests {
         format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())
     }
 
+    fn openai_chunk_with_tool_call_at_index(
+        id: &str,
+        model: &str,
+        tool_index: usize,
+        tool_id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+        finish_reason: Option<&str>,
+    ) -> String {
+        let mut tc = json!({ "index": tool_index });
+        if let Some(tid) = tool_id {
+            tc["id"] = json!(tid);
+            tc["type"] = json!("function");
+        }
+        let mut func = json!({});
+        if let Some(n) = name {
+            func["name"] = json!(n);
+        }
+        if let Some(a) = args {
+            func["arguments"] = json!(a);
+        }
+        if !func.as_object().unwrap().is_empty() {
+            tc["function"] = func;
+        }
+        let mut choice = json!({ "index": 0, "delta": { "tool_calls": [tc] } });
+        if let Some(fr) = finish_reason {
+            choice["finish_reason"] = json!(fr);
+        }
+        let chunk = json!({
+            "id": id,
+            "model": model,
+            "choices": [choice],
+        });
+        format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())
+    }
+
     fn openai_done() -> String {
         "data: [DONE]\n\n".to_string()
     }
@@ -690,5 +726,219 @@ mod tests {
         assert_eq!(block_starts.len(), 2);
         assert_eq!(block_starts[0]["content_block"]["type"], "text");
         assert_eq!(block_starts[1]["content_block"]["type"], "tool_use");
+    }
+
+    // ── Scenario A (fixed): Tool call index mapping prevents misassignment ──
+    //
+    // Previously, `emit_tool_calls` ignored `DeltaToolCall.index` and used its
+    // own `next_index` counter.  When arguments for index0 arrived after
+    // index1 had been opened, they were emitted at the WRONG block (index1).
+    //
+    // After fix:  a `tool_call_map` tracks each upstream index → block index.
+    // Arguments for an already-closed index are dropped instead of misassigned.
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn scenario_a_tool_call_args_not_misassigned_on_interleave() {
+        // Upstream sends args for idx0 AFTER idx1 opened the block.
+        // Fix: these args are silently dropped (Anthropic protocol forbids
+        // appending to a closed block) instead of going to idx1.
+        let chunks = vec![
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 0,
+                Some("call_read"), Some("read_file"), None, None,
+            ),
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 1,
+                Some("call_search"), Some("search_web"), None, None,
+            ),
+            // These args for idx0 arrive too late — block0 already closed
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 0,
+                None, None, Some(r#"{"path":"/etc"}"#), None,
+            ),
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 1,
+                None, None, Some(r#"{}"#), None,
+            ),
+            openai_chunk("chatcmpl-99", "m", None, Some("tool_calls")),
+            openai_done(),
+        ];
+
+        let events = collect_events(chunks, "fallback").await;
+
+        // Collect block info
+        let block_starts: Vec<_> = events.iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .enumerate()
+            .map(|(i, e)| (i, e["index"].as_u64().unwrap(), e["content_block"]["id"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(block_starts.len(), 2);
+
+        // Block0 = call_read, Block1 = call_search
+        assert_eq!(block_starts[0].1, 0); // index0
+        assert_eq!(block_starts[0].2, "call_read");
+        assert_eq!(block_starts[1].1, 1); // index1
+        assert_eq!(block_starts[1].2, "call_search");
+
+        // Verify NO input_json_delta at index0 (call_read's args were dropped)
+        let read_deltas = events.iter()
+            .filter(|e| e["type"] == "content_block_delta"
+                && e["index"] == 0
+                && e["delta"]["type"] == "input_json_delta")
+            .count();
+        assert_eq!(read_deltas, 0,
+            "call_read (index0) must have zero input_json deltas — interleaved args dropped, not misassigned");
+
+        // Verify only ONE input_json_delta at index1 (call_search got its own args)
+        let search_deltas = events.iter()
+            .filter(|e| e["type"] == "content_block_delta"
+                && e["delta"]["type"] == "input_json_delta")
+            .count();
+        assert_eq!(search_deltas, 1,
+            "call_search (index1) must have exactly one input_json delta");
+
+        // Each block properly started, stopped, and message_delta+stop present
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+    }
+
+    // ── Scenario A (correct-order): Normal sequential tool calls ───────────
+    //
+    // When tool call arguments arrive in order (idx0 id → idx0 args → idx1 id
+    // → idx1 args), the fix must NOT break the common case.
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn scenario_a_tool_call_args_correct_order_still_works() {
+        let chunks = vec![
+            // idx0 id+name
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 0,
+                Some("call_0"), Some("read_file"), None, None,
+            ),
+            // idx0 args
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 0,
+                None, None, Some(r#"{"path":"/tmp"}"#), None,
+            ),
+            // idx1 id+name
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 1,
+                Some("call_1"), Some("search_web"), None, None,
+            ),
+            // idx1 args
+            openai_chunk_with_tool_call_at_index(
+                "chatcmpl-99", "m", 1,
+                None, None, Some(r#"{}"#), None,
+            ),
+            openai_chunk("chatcmpl-99", "m", None, Some("tool_calls")),
+            openai_done(),
+        ];
+
+        let events = collect_events(chunks, "fallback").await;
+
+        // Block0: call_read at index0 gets its args
+        let block0_deltas: Vec<_> = events.iter()
+            .filter(|e| e["type"] == "content_block_delta"
+                && e["index"] == 0)
+            .collect();
+        assert_eq!(block0_deltas.len(), 1,
+            "call_read (index0) must get its args in correct order");
+        assert_eq!(block0_deltas[0]["delta"]["partial_json"], r#"{"path":"/tmp"}"#);
+
+        // Block1: call_search at index1 gets its args
+        let block1_deltas: Vec<_> = events.iter()
+            .filter(|e| e["type"] == "content_block_delta"
+                && e["index"] == 1)
+            .collect();
+        assert_eq!(block1_deltas.len(), 1,
+            "call_search (index1) must get its args in correct order");
+    }
+
+    // ── Scenario B (fixed): content after finish_reason gets a NEW block ──
+    //
+    // Previously, `close_current_block` did NOT reset `state.block` to Idle.
+    // Content arriving after finish_reason was emitted as a delta on the
+    // ALREADY-STOPPED block (wrong index).  Then `translate_done` emitted
+    // `message_stop` without closing the block or emitting `message_delta`.
+    //
+    // After fix:
+    //   1. close_current_block resets state.block → content opens a NEW block
+    //   2. translate_done closes open blocks before message_stop
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn scenario_b_content_after_finish_gets_new_block() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-100", "m", Some("Hello"), None),
+            openai_chunk("chatcmpl-100", "m", None, Some("stop")),
+            openai_chunk("chatcmpl-100", "m", Some(" world"), None),
+            openai_done(),
+        ];
+
+        let events = collect_events(chunks, "fallback").await;
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+
+        // After the first content_block_stop(0), a NEW block opens at index1
+        let stop0 = types.iter().position(|t| *t == "content_block_stop").unwrap();
+        let block_starts_after: Vec<_> = events[stop0 + 1..].iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .collect();
+        assert_eq!(block_starts_after.len(), 1,
+            "must open a NEW content block for content arriving after finish_reason");
+        assert_eq!(block_starts_after[0]["index"], 1,
+            "the new block must have a fresh index (1), not the old (0)");
+
+        // The late " world" delta lands at index1, NOT index0
+        let late_delta: Vec<_> = events.iter()
+            .filter(|e| e["type"] == "content_block_delta" && e["delta"]["text"] == " world")
+            .collect();
+        assert_eq!(late_delta.len(), 1);
+        assert_eq!(late_delta[0]["index"], 1,
+            "' world' delta must be at the NEW block index (1), not the old closed block");
+
+        // Stream ends properly: content_block_stop → message_stop
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+        assert_eq!(types.last().unwrap(), &"message_stop");
+    }
+
+    // ── Scenario C (fixed): duplicate finish_reason is idempotent ──────────
+    //
+    // Previously, `emit_finish` always emitted message_delta and
+    // close_current_block could emit duplicate content_block_stop because
+    // state.block was never reset.
+    //
+    // After fix:
+    //   1. emit_finish sets state.finished=true and subsequent calls return early
+    //   2. close_current_block resets state.block → second close is a no-op
+    // ─────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn scenario_c_duplicate_finish_reason_is_idempotent() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-101", "m", Some("Hello"), None),
+            openai_chunk("chatcmpl-101", "m", None, Some("stop")),
+            // second identical finish_reason — should be a no-op
+            openai_chunk("chatcmpl-101", "m", None, Some("stop")),
+            openai_done(),
+        ];
+
+        let events = collect_events(chunks, "fallback").await;
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+
+        // Only ONE content_block_stop
+        let stop_count = types.iter().filter(|t| **t == "content_block_stop").count();
+        assert_eq!(stop_count, 1,
+            "duplicate finish_reason must NOT produce a second content_block_stop");
+
+        // Only ONE message_delta
+        let delta_count = types.iter().filter(|t| **t == "message_delta").count();
+        assert_eq!(delta_count, 1,
+            "duplicate finish_reason must NOT produce a second message_delta");
+
+        // Stream still ends with message_stop
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+
+        // Total event sequence is the canonical 6-event form
+        assert_eq!(types, &["message_start", "content_block_start",
+            "content_block_delta", "content_block_stop",
+            "message_delta", "message_stop"],
+            "duplicate finish_reason must produce exactly the same events as a single finish");
     }
 }
